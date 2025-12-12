@@ -1,0 +1,4 @@
+/dev/mapper/redos-root  /                       xfs     defaults                                                 1 1
+LABEL=BOOT     		/boot                   ext4    defaults 		                                 1 2
+LABEL=ESP		/boot/efi               vfat    defaults,uid=0,gid=0,umask=077,shortname=winnt     	 0 2
+/dev/mapper/redos-swap	none                    swap    defaults						 0 0
