@@ -85,32 +85,6 @@ done
 # 6) Генерация конфигурации GRUB (меню)
 update-grub || true
 
-# 6.1. Синхронизация grub_token между EFI и /boot/grub/grubenv (ALT-специфика)
-echo "[chroot] syncing grub_token"
-
-# где лежит efi grub.cfg (обычно /boot/efi/EFI/ALT/grub.cfg или /boot/efi/EFI/altlinux/grub.cfg)
-efi_cfg=""
-for p in /boot/efi/EFI/*/grub.cfg /boot/efi/EFI/BOOT/grub.cfg; do
-  [ -f "$p" ] && { efi_cfg="$p"; break; }
-done
-
-if [ -n "$efi_cfg" ]; then
-  # вытащить токен из строки вида: if [ "$grub_token" != "fh6oi1bv6hek9hlqekpi5iuj" ]; then
-  token=$(grep -oE '"[0-9a-z]{10,}"' "$efi_cfg" | head -n1 | tr -d '"')
-  if [ -n "$token" ]; then
-    # если grubenv нет — создать
-    if [ ! -f /boot/grub/grubenv ]; then
-      grub-editenv /boot/grub/grubenv create || true
-    fi
-    grub-editenv /boot/grub/grubenv set grub_token="$token" || true
-    echo "[chroot] grub_token set to: $token"
-  else
-    echo "[chroot] WARNING: grub_token not found in $efi_cfg"
-  fi
-else
-  echo "[chroot] WARNING: EFI grub.cfg not found, skip grub_token sync"
-fi
-
 # 7) Отключение встренного /tmp, если нам нужно монтировать свой раздел
 if [ -b /dev/mapper/${vg_name}-tmp ]; then
 cat >/etc/systemd/system/tmp.mount <<EOF
