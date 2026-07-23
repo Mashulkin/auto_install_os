@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # os/redos/80_chroot.sh — CHROOT-этап для RedOS 7.3
-# Версия: v1.2.0
-# Дата:   2025-12-10
+# Версия: v1.3.1
+# Дата:   2026-07-23
 # -----------------------------------------------------------------------------
 # Выполняется после разметки/копирования root.tgz/fstab и персонализации.
 #
@@ -12,8 +12,8 @@
 #      /etc/default/grub и BLS (root=UUID, MachineID, options).
 #   3) Пересобирает initramfs (dracut) с явным добавлением mdraid/lvm.
 #   4) Генерирует /boot/grub2/grub.cfg.
-#   5) Кладёт EFI-пэйлоад на КАЖДЫЙ найденный ESP и создаёт RedOS-загрузчики
-#      на уровне NVRAM (RedOS-A/RedOS-B) без привязки к /boot/efi(2).
+#   5) Кладёт EFI-пэйлоад и темы на КАЖДЫЙ найденный ESP и создаёт RedOS-загрузчики
+#      на уровне NVRAM с динамическим определением регистра вендорской папки.
 #   6) Приводит rescue-ядро к текущему MachineID (переименование файлов и BLS),
 #      затем при необходимости заново генерирует grub.cfg и чистит чужие
 #      rescue-артефакты.
@@ -113,11 +113,9 @@ for kdir in /lib/modules/*; do
   [ -r "$kdir/modules.dep" ] || continue
   kver="$(basename "$kdir")"
   img="/boot/initramfs-${kver}.img"
-  temp_img="/tmp/initramfs_temp_${kver}.img" # <--- NEW: Временный файл для стабильной записи
+  temp_img="/tmp/initramfs_temp_${kver}.img" # Временный файл для стабильной записи
 
   if command -v dracut >/dev/null 2>&1; then
-    # [FIX v1.0.8] Изолируем операцию dracut в подпроцесс, записывая во временный файл в /tmp.
-    # Это обходит низкоуровневые конфликты I/O в chroot, используя модули LVM/RAID.
     echo "[$(date -Is)] [DRACUT] Attempting stable LVM/RAID build to $temp_img..." >&2
 
     # Основная попытка: пишем во временный файл в изолированном подпроцессе
@@ -129,7 +127,7 @@ for kdir in /lib/modules/*; do
         mv -f "$temp_img" "$img" || true
     else
         echo "[$(date -Is)] [DRACUT] WARNING: Primary dracut attempt failed. Running simplified fallback." >&2
-        # Fallback: Если первая попытка упала (например, из-за fwrite), пробуем самый простой вариант
+        # Fallback: Если первая попытка упала, пробуем упрощённый вариант
         dracut -f --no-compress "$img" "$kver" --add "mdraid lvm" || true
     fi
   fi
@@ -155,7 +153,14 @@ install_on_esp() {
   # Выложить пары shim+grub в вендорские каталоги и BOOT (если они есть),
   # иначе собрать standalone BOOTX64.EFI.
   ensure_payload() {
-    local m="$1" blid_alias="RedOS" src="/boot/efi"
+    local m="$1" src="/boot/efi"
+    
+    # Ищем реальное имя вендорской папки на диске (redos или RedOS)
+    local blid_alias
+    blid_alias="$(ls -d "$src/EFI/"*/ 2>/dev/null | grep -iv '/BOOT/' | head -n1 || true)"
+    blid_alias="$(basename "$blid_alias")"
+    [ -z "$blid_alias" ] && blid_alias="redos"
+
     mkdir -p "$m/EFI/$blid_alias" "$m/EFI/BOOT"
 
     copy_pair_from() { # $1=dir with shimx64.efi+grubx64.efi
@@ -179,8 +184,11 @@ install_on_esp() {
       fi
     }
 
-    # Некоторые BIOS ищут grub.cfg в вендорских каталогах
-    [ -f /boot/grub2/grub.cfg ] && cp -f /boot/grub2/grub.cfg "$m/EFI/$blid_alias/grub.cfg"   2>/dev/null || true
+    # Копируем конфиг и темы (для цветного меню RedOS)
+    [ -f /boot/grub2/grub.cfg ] && cp -f /boot/grub2/grub.cfg "$m/EFI/$blid_alias/grub.cfg" 2>/dev/null || true
+    if [ -d "$src/EFI/$blid_alias/themes" ]; then
+      cp -rf "$src/EFI/$blid_alias/themes" "$m/EFI/$blid_alias/" 2>/dev/null || true
+    fi
   }
   ensure_payload "$mnt"
 
@@ -192,12 +200,18 @@ install_on_esp() {
     *)              umount "$mnt"; rmdir "$mnt"; return 0 ;;
   esac
 
-  # Путь загрузчика для NVRAM: если есть shim+grub — указываем shim, иначе BOOTX64.EFI
+  # Ищем точную вендорскую папку в смонтированном ESP под запись efibootmgr
+  local vdir
+  vdir="$(ls -d "$mnt/EFI/"*/ 2>/dev/null | grep -iv '/BOOT/' | head -n1 || true)"
+  vdir="$(basename "$vdir")"
+  [ -z "$vdir" ] && vdir="redos"
+
+  # Путь загрузчика для NVRAM с УЧЁТОМ реального регистра папки
   local loader=''
-  if   [ -f "$mnt/EFI/RedOS/shimx64.efi"   ] && [ -f "$mnt/EFI/RedOS/grubx64.efi"   ]; then
-    loader='\EFI\RedOS\shimx64.efi'
+  if   [ -f "$mnt/EFI/$vdir/shimx64.efi" ] && [ -f "$mnt/EFI/$vdir/grubx64.efi" ]; then
+    loader="\\EFI\\${vdir}\\shimx64.efi"
   elif [ -f "$mnt/EFI/BOOT/BOOTX64.EFI" ]; then
-    loader='\EFI\BOOT\BOOTX64.EFI'
+    loader='\\EFI\\BOOT\\BOOTX64.EFI'
   fi
 
   [ -n "$loader" ] && efibootmgr -c -d "$disk" -p "$part" -L "$label" -l "$loader" || true
@@ -238,7 +252,7 @@ if [ -n "$NEWMID" ]; then
         fi
       done
       # Удаляем старые rescue-артефакты с прежним MID
-      for x in /boot/vmlinуз-0-rescue-* /boot/initramfs-0-rescue-*.img; do
+      for x in /boot/vmlinuz-0-rescue-* /boot/initramfs-0-rescue-*.img; do
         [ -e "$x" ] || continue
         case "$x" in *"-0-rescue-${NEWMID}"*|*"-0-rescue-${NEWMID}.img") : ;; *) rm -f -- "$x" || true ;; esac
       done
@@ -391,12 +405,3 @@ umount /mnt/target          2>/dev/null || umount -l /mnt/target          2>/dev
 
 echo; echo "RedOS restored! Log saved to /root/deploy.log"; echo
 sleep 3; reboot
-
-# -----------------------------------------------------------------------------
-# Предложения по улучшению (не влияют на работу скрипта):
-# 1) Если в образе несколько ядер, логировать список /lib/modules/* и активное ядро
-#    (uname -r в chroot) перед сборкой initramfs — удобнее отлавливать несогласованности.
-# 2) Для shim: если secure boot не используется, можно не копировать пары shim+grub,
-#    а всегда делать standalone — управляемо через переменную EFI_STANDALONE_ONLY=true.
-# -----------------------------------------------------------------------------
-

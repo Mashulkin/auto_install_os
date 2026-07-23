@@ -1,15 +1,15 @@
 #!/bin/bash
 # =============================================================================
 # 30_partition_system.sh — разметка системных дисков и монтаж целевой ФС
-# Версия: v2.2.2
-# Дата:   2025-12-11
+# Версия: v2.3.0
+# Дата:   2026-07-23
 # -----------------------------------------------------------------------------
 # Поддерживаем два сценария:
 #   • ДВА ДИСКА: RAID1 для /boot (md0, metadata=1.0) и для data (md1, metadata=1.2).
-#                 ESP создаётся на КАЖДОМ диске отдельно (НЕ RAID).
+#                ESP создаётся на КАЖДОМ диске отдельно (НЕ RAID).
 #   • ОДИН ДИСК: GPT + LVM (ESP + /boot + PV → VG → LV swap + LV root).
 #
-# Модифицирован для поддержки произвольных LV (var, tmp, home, varlog, vartmp) 
+# Модифицирован для поддержки произвольных LV (var, tmp, home, varlog, varlogaudit, vartmp)
 # и выбора типа ФС (FS TYPE) из install.env.
 #
 # КЛЮЧЕВОЙ ФИКС ДЛЯ KERNEL 5.x: mkfs.xfs использует флаги из install.env.
@@ -26,9 +26,10 @@ mkdir -p /mnt/target
 : "${vartmp_mb:=0}"
 : "${home_mb:=0}"
 : "${varlog_lv_mb:=0}"
+: "${varlogaudit_lv_mb:=0}"
 : "${use_varlog_disk:=false}"
 : "${vg_name:=vg0}"
-: "${swap_mb:=0}" 
+: "${swap_mb:=0}"
 : "${xfs_compat_flags:=}" # Используем переменную из install.env
 
 # Определяем значения по умолчанию для FS, если они не заданы в install.env
@@ -37,7 +38,8 @@ mkdir -p /mnt/target
 : "${tmp_fs:=ext4}"
 : "${vartmp_fs:=ext4}"
 : "${home_fs:=ext4}"
-: "${varlog_lv_fs:=ext4}" 
+: "${varlog_lv_fs:=ext4}"
+: "${varlogaudit_lv_fs:=ext4}"
 
 # ------------------------------ Вспомогалки ----------------------------------
 
@@ -70,7 +72,7 @@ create_md_with_retry() {
   mdadm --stop --scan 2>/dev/null || true
   for p in "${members[@]}"; do
     mdadm  --zero-superblock --force "$p" 2>/dev/null || true
-    wipefs -af "$p"              2>/dev/null || true
+    wipefs -af "$p"               2>/dev/null || true
   done
   udevadm settle || true
   sleep 0.5
@@ -119,7 +121,7 @@ if ((${#TARGET[@]}>=2)); then
     mnt=$(findmnt -rno TARGET --source "$p" 2>/dev/null || true)
     [ -n "$mnt" ] && (umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true)
     mdadm  --zero-superblock --force "$p" 2>/dev/null || true
-    wipefs -af "$p"              2>/dev/null || true
+    wipefs -af "$p"               2>/dev/null || true
     dd if=/dev/zero of="$p" bs=1M count=16 oflag=direct conv=fsync 2>/dev/null || true
   done
   udevadm settle || true
@@ -153,9 +155,9 @@ if ((${#TARGET[@]}>=2)); then
   # LVM поверх md_data
   pvcreate -ff -y "$md_data"
   vgcreate "$vg_name" "$md_data"
-  
+
   # --- Создание LV с фиксированным размером (если > 0) ---
-  
+
   # SWAP
   if [ "${swap_mb}" -gt 0 ]; then
     log "[LVM] Create swap LV (${swap_mb}M)"
@@ -186,6 +188,12 @@ if ((${#TARGET[@]}>=2)); then
       lvcreate -L ${varlog_lv_mb}M "$vg_name" -n varlog -y
   fi
 
+  # /var/log/audit (только если не выносится на отдельный диск и задан размер)
+  if [[ "${use_varlog_disk}" != "true" && "${varlogaudit_lv_mb}" -gt 0 ]]; then
+      log "[LVM] Create /var/log/audit LV (${varlogaudit_lv_mb}M)"
+      lvcreate -L ${varlogaudit_lv_mb}M "$vg_name" -n varlogaudit -y
+  fi
+
   # --- Логика для / и /var ---
   if [ "${var_mb}" -gt 0 ]; then
       # НОВАЯ СХЕМА: / получает заданный root_mb, /var получает все остальное (100%FREE)
@@ -205,7 +213,7 @@ if ((${#TARGET[@]}>=2)); then
       export VAR_LV=""
       export ROOT_LV="/dev/mapper/${vg_name}-root"
   fi
-  
+
   # --- Форматирование и Монтирование ---
 
   # ESP/BOOT/SWAP
@@ -298,6 +306,24 @@ if ((${#TARGET[@]}>=2)); then
     fi
   fi
 
+  # /var/log/audit (LV)
+  export VARLOGAUDIT_LV="/dev/mapper/${vg_name}-varlogaudit"
+  if [[ "${use_varlog_disk}" != "true" && "${varlogaudit_lv_mb}" -gt 0 ]] && [ -b "$VARLOGAUDIT_LV" ]; then
+    log "[FS] Format and mount /var/log/audit LV ($varlogaudit_lv_fs)"
+    if [ ! -d /mnt/target/var/log ]; then mkdir -p /mnt/target/var/log; fi
+    mkdir -p /mnt/target/var/log/audit
+    if [[ "$varlogaudit_lv_fs" == "xfs" ]]; then
+      # KERNEL 5.x FIX: Используем mkfs.xfs с флагами совместимости
+      umount_if "$VARLOGAUDIT_LV"
+      wipefs -a "$VARLOGAUDIT_LV" || true
+      mkfs.xfs -f -L VARLOGAUDIT ${xfs_compat_flags} -n ftype=1 "$VARLOGAUDIT_LV"
+      mount -t xfs -o noatime "$VARLOGAUDIT_LV" /mnt/target/var/log/audit
+    else
+      mkfs_ext4 "$VARLOGAUDIT_LV" VARLOGAUDIT
+      mount -t ext4 -o noatime "$VARLOGAUDIT_LV" /mnt/target/var/log/audit
+    fi
+  fi
+
   # /home
   export HOME_LV="/dev/mapper/${vg_name}-home"
   if [ "${home_mb}" -gt 0 ] && [ -b "$HOME_LV" ]; then
@@ -347,9 +373,9 @@ else
   # LVM поверх третьего раздела
   pvcreate "$p3"
   vgcreate "$vg_name" "$p3"
-  
+
   # --- Создание LV с фиксированным размером (если > 0) ---
-  
+
   # SWAP
   if [ "${swap_mb}" -gt 0 ]; then
     log "[LVM] Create swap LV (${swap_mb}M)"
@@ -378,6 +404,12 @@ else
   if [[ "${use_varlog_disk}" != "true" && "${varlog_lv_mb}" -gt 0 ]]; then
       log "[LVM] Create /var/log LV (${varlog_lv_mb}M)"
       lvcreate -L ${varlog_lv_mb}M "$vg_name" -n varlog -y
+  fi
+
+  # /var/log/audit (только если не выносится на отдельный диск и задан размер)
+  if [[ "${use_varlog_disk}" != "true" && "${varlogaudit_lv_mb}" -gt 0 ]]; then
+      log "[LVM] Create /var/log/audit LV (${varlogaudit_lv_mb}M)"
+      lvcreate -L ${varlogaudit_lv_mb}M "$vg_name" -n varlogaudit -y
   fi
 
   # --- Логика для / и /var ---
@@ -489,11 +521,29 @@ else
     fi
   fi
 
+  # /var/log/audit (LV)
+  export VARLOGAUDIT_LV="/dev/mapper/${vg_name}-varlogaudit"
+  if [[ "${use_varlog_disk}" != "true" && "${varlogaudit_lv_mb}" -gt 0 ]] && [ -b "$VARLOGAUDIT_LV" ]; then
+    log "[FS] Format and mount /var/log/audit LV ($varlogaudit_lv_fs)"
+    if [ ! -d /mnt/target/var/log ]; then mkdir -p /mnt/target/var/log; fi
+    mkdir -p /mnt/target/var/log/audit
+    if [[ "$varlogaudit_lv_fs" == "xfs" ]]; then
+      # KERNEL 5.x FIX: Используем mkfs.xfs с флагами совместимости
+      umount_if "$VARLOGAUDIT_LV"
+      wipefs -a "$VARLOGAUDIT_LV" || true
+      mkfs.xfs -f -L VARLOGAUDIT ${xfs_compat_flags} -n ftype=1 "$VARLOGAUDIT_LV"
+      mount -t xfs -o noatime "$VARLOGAUDIT_LV" /mnt/target/var/log/audit
+    else
+      mkfs_ext4 "$VARLOGAUDIT_LV" VARLOGAUDIT
+      mount -t ext4 -o noatime "$VARLOGAUDIT_LV" /mnt/target/var/log/audit
+    fi
+  fi
+
   # /home
   export HOME_LV="/dev/mapper/${vg_name}-home"
   if [ "${home_mb}" -gt 0 ] && [ -b "$HOME_LV" ]; then
     log "[FS] Format and mount /home ($home_fs)"
-    mkdir -п /mnt/target/home
+    mkdir -p /mnt/target/home
     if [[ "$home_fs" == "xfs" ]]; then
       # KERNEL 5.x FIX: Используем mkfs.xfs с флагами совместимости
       umount_if "$HOME_LV"
@@ -515,12 +565,3 @@ else
   # Экспортируем для следующих шагов
   export p1 p2
 fi
-
-# -----------------------------------------------------------------------------
-# Предложения по улучшению (идеи; не влияют на работу шага):
-#
-# 1) После создания md_data опционально заполнять нулями первые N гигабайт
-#    (blkdiscard/dd) — это может ускорить инициализацию ФС и последующую
-#    работу на некоторых контроллерах/SSD.
-# -----------------------------------------------------------------------------
-
